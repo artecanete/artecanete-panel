@@ -23,13 +23,13 @@ def get_initial_data():
         "caja_actual": 200.00,
         "FSE_contador": 0,
         "FST_contador": 0,
-        "retiros": [] # La clave crucial que podría faltar
+        "retiros": [] 
     }
 
 def cargar_datos():
     """
-    Carga los datos principales del TPV, asegurando que todas las claves existan.
-    Esto protege contra errores 500 si el archivo guardado es de una versión anterior.
+    Carga los datos principales del TPV, asegurando que todas las claves existan 
+    y manejando archivos JSON corruptos.
     """
     data = get_initial_data() # Inicializa con la estructura completa
     if os.path.exists(DATA_FILE):
@@ -38,9 +38,12 @@ def cargar_datos():
                 loaded_data = json.load(f)
                 # Fusiona la data cargada sobre la estructura inicial
                 data.update(loaded_data)
-        except Exception:
-            # Si hay error al cargar, usamos la estructura inicial completa (data)
-            print("Advertencia: Archivo de datos corrupto o vacío, usando estructura inicial.")
+        except json.JSONDecodeError:
+            # Si el archivo JSON está corrupto, imprime advertencia y devuelve la estructura inicial
+            print("Advertencia: Archivo de datos corrupto (JSON inválido). Usando estructura inicial.")
+        except Exception as e:
+             # Cualquier otro error de carga
+            print(f"Error al cargar datos del archivo: {e}")
             pass
     return data
 
@@ -52,7 +55,8 @@ def guardar_datos(data):
     except Exception as e:
         print(f"Error al guardar datos: {e}")
 
-# --- SINCRONIZACIÓN WEB (ROBUSTA) ---
+
+# --- SINCRONIZACIÓN WEB (A PRUEBA DE FALLOS) ---
 @app.route('/sync', methods=['POST'])
 def sync():
     """Recibe el payload completo del TPV de escritorio y actualiza el estado del servidor."""
@@ -63,26 +67,33 @@ def sync():
             
         data = cargar_datos()
 
-        # Helper para fusionar listas por ID (o 'fecha' para retiros)
         def merge_list(existing_list, new_list, id_key):
-            ids_existentes = {item.get(id_key) for item in existing_list if item.get(id_key)}
+            """Fusiona una lista nueva a la existente, filtrando entradas inválidas y duplicadas."""
+            # 1. Limpiar y obtener IDs existentes
+            # Solo consideramos diccionarios con la clave 'id' para evitar crashes en el servidor.
+            existing_list = [
+                item for item in existing_list 
+                if isinstance(item, dict) and item.get(id_key)
+            ]
+            ids_existentes = {item[id_key] for item in existing_list}
             updates = 0
+            
+            # 2. Agregar nuevos ítems válidos
             for new_item in new_list:
-                # Usamos una clave de ID que es única y consistente (UUID en Ventas.py)
                 item_id = new_item.get(id_key)
-                if item_id and item_id not in ids_existentes:
+                if isinstance(new_item, dict) and item_id and item_id not in ids_existentes:
                     existing_list.append(new_item)
                     updates += 1
+                    
             return existing_list, updates
 
         # 1. Sincronización de Juegos (Inventario - El TPV es la fuente maestra)
         data['juegos'] = nuevo_payload.get('juegos', [])
 
         # 2. Sincronización de Ventas, Devoluciones y Retiros
-        # Usamos 'id' para Ventas/Devoluciones, que ahora se genera con UUID
+        # Usamos 'id' para la unificación en todas las listas transaccionales
         data['ventas'], nuevas_ventas = merge_list(data['ventas'], nuevo_payload.get('ventas', []), 'id')
         data['devoluciones'], nuevas_devoluciones = merge_list(data['devoluciones'], nuevo_payload.get('devoluciones', []), 'id')
-        # Usamos 'id' para Retiros también, ya que se generó un UUID en Ventas.py
         data['retiros'], nuevos_retiros = merge_list(data['retiros'], nuevo_payload.get('retiros', []), 'id') 
 
         # 3. Sincronización de Caja y Fichas (Reemplazar)
@@ -103,8 +114,9 @@ def sync():
         }, 200
 
     except Exception as e:
-        # Devuelve el error para ayudar a la depuración en el TPV
-        print(f"ERROR EN SINCRONIZACIÓN WEB: {e}")
+        # Esto capturará cualquier fallo inesperado y lo devolverá en el error 500
+        # Esto nos ayuda a depurar el problema en el TPV si persiste
+        print(f"ERROR EN SINCRONIZACIÓN WEB (Catch-all): {e}")
         return {"status": "error", "message": f"Fallo interno del servidor: {str(e)}"}, 500
 
 # --- LÓGICA DE REPORTES ---
@@ -126,7 +138,10 @@ def generar_reporte_html(data):
     total_tarjeta_vendido = sum(v.get('total', 0) for v in ventas if v.get('metodo') == 'Tarjeta')
     
     # --- Stock Crítico ---
-    stock_critico = [j for j in juegos if j.get('stock', 0) <= 5 and j.get('stock', 0) > 0]
+    # Aseguramos que solo procesamos diccionarios válidos
+    juegos_validos = [j for j in juegos if isinstance(j, dict)]
+    stock_critico = [j for j in juegos_validos if j.get('stock', 0) <= 5 and j.get('stock', 0) > 0]
+    
     stock_critico_html = ""
     if stock_critico:
         stock_critico_html = "<table class='min-w-full divide-y divide-gray-200'><thead><tr><th class='px-4 py-2'>Nombre</th><th class='px-4 py-2'>Stock</th></tr></thead><tbody>"
