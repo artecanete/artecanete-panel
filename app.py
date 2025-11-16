@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import os
 import plotly.graph_objects as go
 from collections import defaultdict
-# Nota: Eliminé el logging para simplificar el entorno de Canvas
+import uuid
 
 app = Flask(__name__)
 app.secret_key = "artecanete2025" # Cambia esto por una clave secreta segura
@@ -15,7 +15,7 @@ DATA_FILE = "tienda_data.json"
 # --- Funciones de Persistencia para el Servidor ---
 
 def get_initial_data():
-    """Estructura inicial de datos para el servidor."""
+    """Estructura inicial completa de datos para el servidor."""
     return {
         "juegos": [], 
         "ventas": [], 
@@ -23,19 +23,26 @@ def get_initial_data():
         "caja_actual": 200.00,
         "FSE_contador": 0,
         "FST_contador": 0,
-        "retiros": []
+        "retiros": [] # La clave crucial que podría faltar
     }
 
 def cargar_datos():
-    """Carga los datos principales del TPV (inventario, ventas, devoluciones)."""
+    """
+    Carga los datos principales del TPV, asegurando que todas las claves existan.
+    Esto protege contra errores 500 si el archivo guardado es de una versión anterior.
+    """
+    data = get_initial_data() # Inicializa con la estructura completa
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, 'r') as f:
-                return json.load(f)
+                loaded_data = json.load(f)
+                # Fusiona la data cargada sobre la estructura inicial
+                data.update(loaded_data)
         except Exception:
-            # En caso de error de carga, devuelve la estructura inicial
+            # Si hay error al cargar, usamos la estructura inicial completa (data)
+            print("Advertencia: Archivo de datos corrupto o vacío, usando estructura inicial.")
             pass
-    return get_initial_data()
+    return data
 
 def guardar_datos(data):
     """Guarda todos los datos principales en un solo archivo."""
@@ -56,26 +63,27 @@ def sync():
             
         data = cargar_datos()
 
-        # Las listas de datos transaccionales se fusionan, las métricas se reemplazan
-        
-        # 1. Sincronización de Juegos (Inventario - El TPV es la fuente maestra)
-        data['juegos'] = nuevo_payload.get('juegos', [])
-
-        # 2. Sincronización de Ventas, Devoluciones y Retiros (Añadir solo los nuevos por ID/Fecha)
-        
         # Helper para fusionar listas por ID (o 'fecha' para retiros)
         def merge_list(existing_list, new_list, id_key):
-            ids_existentes = {item.get(id_key) for item in existing_list}
+            ids_existentes = {item.get(id_key) for item in existing_list if item.get(id_key)}
             updates = 0
             for new_item in new_list:
-                if new_item.get(id_key) and new_item.get(id_key) not in ids_existentes:
+                # Usamos una clave de ID que es única y consistente (UUID en Ventas.py)
+                item_id = new_item.get(id_key)
+                if item_id and item_id not in ids_existentes:
                     existing_list.append(new_item)
                     updates += 1
             return existing_list, updates
 
+        # 1. Sincronización de Juegos (Inventario - El TPV es la fuente maestra)
+        data['juegos'] = nuevo_payload.get('juegos', [])
+
+        # 2. Sincronización de Ventas, Devoluciones y Retiros
+        # Usamos 'id' para Ventas/Devoluciones, que ahora se genera con UUID
         data['ventas'], nuevas_ventas = merge_list(data['ventas'], nuevo_payload.get('ventas', []), 'id')
         data['devoluciones'], nuevas_devoluciones = merge_list(data['devoluciones'], nuevo_payload.get('devoluciones', []), 'id')
-        data['retiros'], nuevos_retiros = merge_list(data['retiros'], nuevo_payload.get('retiros', []), 'fecha') # Retiros usa 'fecha' como identificador
+        # Usamos 'id' para Retiros también, ya que se generó un UUID en Ventas.py
+        data['retiros'], nuevos_retiros = merge_list(data['retiros'], nuevo_payload.get('retiros', []), 'id') 
 
         # 3. Sincronización de Caja y Fichas (Reemplazar)
         data['caja_actual'] = nuevo_payload.get('caja_actual', data['caja_actual'])
