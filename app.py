@@ -1,289 +1,257 @@
-from flask import Flask, render_template, request, session, redirect
+from flask import Flask, request, session, redirect
+from datetime import datetime
 import json
-from datetime import datetime, timedelta
+from collections import defaultdict
+import plotly.graph_objs as go
+import plotly.io as pio
 import os
+import uuid
+
+# Importar la configuración de Firebase
+from firebase_config import DB
 
 app = Flask(__name__)
-# Es crucial usar una clave secreta fuerte y gestionada por variables de entorno en producción
-app.secret_key = "artecanete2025" 
+# Usaremos una clave secreta del entorno para mayor seguridad
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'artecanete2025_default_key')
 
-# --- Archivos NO PERSISTENTES en Render (CAUSA DEL PROBLEMA) ---
-# ESTOS DEBEN SER REEMPLAZADOS por llamadas a una Base de Datos Externa (e.g., Firestore, PostgreSQL)
-DATA_FILE = "data.json"
-CONTROL_CAJA_FILE = "control_caja.json"
-# -----------------------------------------------------------------
-
-def cargar_datos():
-    """Carga los datos desde data.json. En Render, estos archivos se reinician
-    frecuentemente, causando el problema de no actualización."""
-    if os.path.exists(DATA_FILE):
+# --- FUNCIONES DE GRÁFICO ---
+def generar_grafico_ventas(ventas):
+    """Genera un gráfico de barras interactivo de ventas por hora."""
+    ventas_por_hora = defaultdict(float)
+    
+    # Filtrar ventas de hoy y acumular por hora
+    hoy = datetime.now().date()
+    for v in ventas:
         try:
-            with open(DATA_FILE) as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Error al cargar datos: {e}")
+            # Asume que la fecha está en formato ISO
+            fecha_venta = datetime.fromisoformat(v["fecha_venta"])
+            if fecha_venta.date() == hoy:
+                hora = fecha_venta.hour
+                ventas_por_hora[hora] += sum(item['precio'] * item['cantidad'] for item in v['productos'])
+        except Exception:
             pass
-    return {"ventas": [], "devoluciones": [], "caja_actual": 200.00, "stock": {}}
 
-def cargar_movimientos():
-    """Carga los movimientos de caja desde control_caja.json."""
-    if os.path.exists(CONTROL_CAJA_FILE):
-        try:
-            with open(CONTROL_CAJA_FILE) as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Error al cargar movimientos: {e}")
-            return []
-    return []
+    horas = sorted(ventas_por_hora.keys())
+    montos = [ventas_por_hora[h] for h in horas]
 
-# --- RUTAS DE AUTENTICACIÓN ---
+    fig = go.Figure(data=[
+        go.Bar(
+            x=[f"{h}:00" for h in horas], 
+            y=montos,
+            marker_color='#007bff'
+        )
+    ])
+    
+    fig.update_layout(
+        title='Ventas Totales por Hora (Hoy)',
+        xaxis_title='Hora del Día',
+        yaxis_title='Monto Total Vendido (€)',
+        xaxis_tickangle=-45,
+        plot_bgcolor='#f8f9fa',
+        paper_bgcolor='#f8f9fa',
+        margin=dict(l=40, r=20, t=40, b=40),
+        height=300
+    )
+    return pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+
+# --- RUTAS DE LA APLICACIÓN ---
 
 @app.route('/')
 def login():
-    # Estilos CSS en línea para la página de login
+    """Página de login simple."""
+    if 'logged_in' in session:
+        return redirect('/dashboard')
+        
     return '''
-    <html><body style="font-family:Arial;text-align:center;padding:50px;background:#f0f0f0;">
-    <h1>🛒 Arte Cañete - Panel</h1>
-    <form method="post" action="/login" style="background:white;padding:30px;margin:auto;width:320px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.1);">
-    <input type="text" name="user" placeholder="Usuario" required style="width:100%;padding:12px;margin:8px 0;border:1px solid #ddd;border-radius:6px;font-size:16px;"><br>
-    <input type="password" name="pass" placeholder="Contraseña" required style="width:100%;padding:12px;margin:8px 0;border:1px solid #ddd;border-radius:6px;font-size:16px;"><br>
-    <button type="submit" style="width:100%;padding:12px;background:#007bff;color:white;border:none;border-radius:6px;font-size:16px;font-weight:bold;">Entrar</button>
-    </form></body></html>
-    '''
+    <html><head><title>Login</title><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.tailwindcss.com"></script><style>
+        .login-card { max-width: 400px; margin: 100px auto; padding: 40px; }
+    </style></head>
+    <body class="bg-gray-100 font-sans">
+    <div class="login-card bg-white rounded-xl shadow-2xl">
+        <h1 class="text-3xl font-bold mb-6 text-gray-800">Acceso a Panel</h1>
+        <form method="post" action="/login">
+            <input type="password" name="password" placeholder="Contraseña de Administrador" required
+                   class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 mb-4 text-lg">
+            <button type="submit" class="w-full bg-blue-600 text-white font-semibold py-3 rounded-lg hover:bg-blue-700 transition duration-300 shadow-md">
+                Ingresar
+            </button>
+        </form>
+    </div>
+    </body></html>'''
 
 @app.route('/login', methods=['POST'])
 def do_login():
-    if request.form['user'] == 'admin' and request.form['pass'] == 'artecanete2025':
+    """Maneja la autenticación. La clave es 'admin'."""
+    ADMIN_PASSWORD = "admin" # Contraseña simple, cambiar en producción
+    if request.form['password'] == ADMIN_PASSWORD:
         session['logged_in'] = True
         return redirect('/dashboard')
-    return "Credenciales incorrectas", 401
+    else:
+        return redirect('/')
+
+@app.route('/dashboard')
+def dashboard():
+    """Muestra el panel de control, cargando datos desde Firebase."""
+    if not session.get('logged_in'):
+        return redirect('/')
+
+    data = DB.get_data()
+    ventas = data.get("ventas", [])
+    caja_actual = data.get("caja_actual", 0.00)
+    stock = data.get("stock", {})
+    retiros = data.get("retiros", [])
+
+    # Cálculo de métricas
+    total_ventas = sum(sum(item['precio'] * item['cantidad'] for item in v['productos']) for v in ventas)
+    
+    # Ordenar retiros por fecha descendente
+    try:
+        retiros_ordenados = sorted(retiros, key=lambda r: r.get('fecha', ''), reverse=True)
+    except TypeError:
+        retiros_ordenados = retiros
+
+    # 1. Gráfico de ventas por hora
+    grafico_horas = generar_grafico_ventas(ventas)
+
+    # 2. Resumen de Stock
+    stock_html = ""
+    for producto, cantidad in stock.items():
+        stock_html += f"<tr><td>{producto}</td><td class='text-center'>{'<span class=\"text-red-500 font-bold\">' if cantidad < 5 else ''}{cantidad}{'</span>' if cantidad < 5 else ''}</td></tr>"
+
+    # 3. Retiros
+    retiros_html = ""
+    for r in retiros_ordenados[:5]: # Mostrar solo los 5 últimos
+        try:
+            fecha_retiro = datetime.fromisoformat(r['fecha']).strftime('%d/%m/%Y %H:%M')
+        except ValueError:
+            fecha_retiro = r['fecha'] # Mostrar la fecha tal cual si no es ISO
+            
+        retiros_html += f"<tr><td>{fecha_retiro}</td><td class='text-right text-red-600'>-€{r['importe']:.2f}</td></tr>"
+        
+    html = f'''
+    <html><head><title>Dashboard ArteCanete</title><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.tailwindcss.com"></script><style>
+        .card {{ background-color: #fff; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); margin-bottom: 20px; }}
+        h1 {{ border-bottom: 2px solid #007bff; padding-bottom: 10px; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #e9ecef; }}
+        th {{ background-color: #007bff; color: white; text-align: center; }}
+        .metric-card {{ background-color: #e9f5ff; border: 1px solid #007bff; text-align: center; padding: 15px; border-radius: 8px; }}
+        .metric-value {{ font-size: 2.5rem; font-weight: bold; color: #007bff; }}
+        /* Responsive Grid */
+        @media (min-width: 768px) {{
+            .grid-cols-2 {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+            .grid-cols-3 {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+        }}
+    </style></head>
+    <body class="bg-gray-100 p-4 md:p-8 font-sans">
+    <div class="max-w-7xl mx-auto">
+        <h1 class="text-4xl font-extrabold text-gray-800 mb-8">Panel de Control de Tienda</h1>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div class="metric-card">
+                <div class="text-sm font-medium text-gray-600">Total Vendido (Histórico)</div>
+                <div class="metric-value">€{total_ventas:.2f}</div>
+            </div>
+            <div class="metric-card bg-green-100 border-green-600">
+                <div class="text-sm font-medium text-gray-600">Caja Actual (Reportada)</div>
+                <div class="metric-value text-green-600">€{caja_actual:.2f}</div>
+            </div>
+            <div class="metric-card bg-yellow-100 border-yellow-600">
+                <div class="text-sm font-medium text-gray-600">Items Diferentes en Stock</div>
+                <div class="metric-value text-yellow-600">{len(stock)}</div>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            
+            <div class="card lg:col-span-2">
+                <h2>📊 Ventas por Hora (Hoy)</h2>
+                <div style="text-align:center;overflow-x:auto;">{grafico_horas}</div>
+            </div>
+
+            <div class="card">
+                <h2>📦 Resumen de Stock</h2>
+                <div class="max-h-96 overflow-y-auto">
+                    <table>
+                        <thead><tr><th>Producto</th><th class="text-center">Cantidad</th></tr></thead>
+                        <tbody>{stock_html or "<tr><td colspan='2' style='text-align:center;color:#666;'>No hay datos de stock</td></tr>"}</tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card lg:col-span-1">
+                <h2>🔄 Últimos Retiros de Caja</h2>
+                <table>
+                    <thead><tr><th>Fecha</th><th class="text-right">Importe</th></tr></thead>
+                    <tbody>{retiros_html or "<tr><td colspan='2' style='text-align:center;color:#666;'>No hay retiros registrados</td></tr>"}</tbody>
+                </table>
+            </div>
+
+        </div>
+
+        <a href="/logout" class="mt-8 inline-block bg-red-600 text-white font-semibold py-2 px-6 rounded-lg hover:bg-red-700 transition duration-300">Cerrar Sesión</a>
+    </div>
+    </body></html>'''
+    return html
 
 @app.route('/logout')
 def logout():
     session.clear()
     return redirect('/')
 
-# --- RUTA DE SINCRONIZACIÓN (NECESITA DB) ---
-
 @app.route('/sync', methods=['POST'])
 def sync():
-    """
-    IMPORTANTE: Esta ruta escribe en archivos locales (data.json), lo que NO FUNCIONA 
-    correctamente en Render debido al sistema de archivos efímero.
-    Para la persistencia de datos, debe ser reescrita para interactuar con una 
-    Base de Datos Externa (PostgreSQL, Firestore, etc.).
-    """
+    """Endpoint llamado por el TPV local para sincronizar datos con Firebase."""
     nuevo = request.json
-    data = cargar_datos()
     
-    # 1. Actualizar Caja Actual
+    # 1. Cargar el estado actual desde Firebase
+    data = DB.get_data()
+    
+    # 2. Sincronizar Caja Actual
     data["caja_actual"] = nuevo.get("caja_actual", data["caja_actual"])
     
-    # 2. Procesar Ventas
-    # NOTA: En un sistema de producción, las ventas deberían tener un ID único para evitar 
-    # la duplicación y mejorar el rendimiento, en lugar de la comparación de diccionarios.
+    # 3. Sincronizar Retiros de Caja (Añadir los nuevos que vienen del TPV)
+    retiros_pendientes = nuevo.get("retiros_pendientes", [])
+    if retiros_pendientes:
+        data["retiros"].extend(retiros_pendientes)
+
+    # Conjuntos de IDs existentes para evitar duplicados
+    ventas_existentes_ids = set(v.get("id") for v in data["ventas"] if "id" in v)
+    devoluciones_existentes_ids = set(d.get("id") for d in data["devoluciones"] if "id" in d)
+
+    # 4. Sincronizar Ventas (añadir solo las nuevas)
     for v in nuevo.get("ventas", []):
-        if v not in data["ventas"]:
+        if v.get("id") and v["id"] not in ventas_existentes_ids:
             data["ventas"].append(v)
-            # Actualizar Stock
+            # Actualizar Stock (restar)
             for p in v["productos"]:
                 prod = p["producto"]
-                if prod in data["stock"]:
-                    data["stock"][prod] -= p["cantidad"]
-    
-    # 3. Procesar Devoluciones
+                cantidad = p["cantidad"]
+                data["stock"][prod] = data["stock"].get(prod, 0) - cantidad
+
+
+    # 5. Sincronizar Devoluciones (añadir solo las nuevas)
     for d in nuevo.get("devoluciones", []):
-        if d not in data["devoluciones"]:
+        if d.get("id") and d["id"] not in devoluciones_existentes_ids:
             data["devoluciones"].append(d)
-            if d["producto"] in data["stock"]:
-                data["stock"][d["producto"]] += 1
-            data["caja_actual"] -= d["total"]
-    
-    # --- ESCRITURA NO PERSISTENTE EN RENDER ---
-    try:
-        with open(DATA_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        # Esto podría fallar si el contenedor está en un estado de solo lectura.
-        print(f"Error de escritura de archivo local: {e}")
-        return {"message": "Error al guardar localmente", "error": str(e)}, 500
-    # ------------------------------------------
+            # Actualizar Stock (sumar)
+            for p in d["productos"]:
+                prod = p["producto"]
+                cantidad = p["cantidad"]
+                data["stock"][prod] = data["stock"].get(prod, 0) + cantidad
 
-    return "OK"
 
-# --- RUTA DEL DASHBOARD ---
-
-@app.route('/dashboard')
-def dashboard():
-    if not session.get('logged_in'):
-        return redirect('/')
-    
-    # Si esta función se ejecutara en Render y los archivos estuvieran vacíos, 
-    # el dashboard mostraría 0 ventas.
-    data = cargar_datos()
-    movimientos = cargar_movimientos() # Aquí asumo que la app de caja también guarda movimientos.
-    hoy = datetime.now().strftime("%d/%m/%Y")
-    ventas = data.get("ventas", [])
-    
-    # === CAJA ACTUAL ===
-    caja_actual = data.get("caja_actual", 200.0)
-    ultimo_retiro = next((m for m in reversed(movimientos) if m.get("tipo") == "Retiro de dueño"), None)
-    ultimo_retiro_texto = f"Último retiro: €{abs(ultimo_retiro['importe']):.2f} ({ultimo_retiro['fecha']})" if ultimo_retiro else "Sin retiros"
-
-    # === VENTAS HOY ===
-    ventas_hoy = [v for v in ventas if v["fecha"].startswith(hoy)]
-    total_hoy = sum(v["total"] for v in ventas_hoy)
-
-    # === VENTAS POR DÍA (ÚLTIMOS 7 DÍAS) ===
-    ventas_por_dia = {}
-    for i in range(6, -1, -1):
-        fecha = (datetime.now() - timedelta(days=i)).strftime("%d/%m")
-        ventas_por_dia[fecha] = 0
-    for v in ventas:
-        fecha_corta = v["fecha"][:5]
-        if fecha_corta in ventas_por_dia:
-            # Suma total de ventas por día
-            ventas_por_dia[fecha_corta] += v["total"]
-    
-    max_dia = max(ventas_por_dia.values()) if ventas_por_dia else 1
-    grafico_dias = ""
-    for fecha, total in ventas_por_dia.items():
-        alto = int((total / max_dia) * 180) if max_dia > 0 else 0
-        grafico_dias += f'''
-        <div style="text-align:center;margin:0 8px;flex:1;">
-            <div style="background:#007bff;height:{alto}px;width:100%;border-radius:6px;"></div>
-            <small style="display:block;margin-top:5px;font-weight:bold;">{fecha}<br>€{total:.0f}</small>
-        </div>'''
-
-    # === VENTAS POR HORA (HOY) ===
-    horas = {f"{h:02d}": 0 for h in range(9, 22)} # Rango de 9h a 21h (excluido 22)
-    for v in ventas_hoy:
-        hora = v["fecha"].split()[1][:2]
-        if hora in horas:
-            horas[hora] += v["total"]
-    max_hora = max(horas.values()) if horas else 1
-    grafico_horas = ""
-    for hora, total in horas.items():
-        alto = int((total / max_hora) * 120) if max_hora > 0 else 0
-        grafico_horas += f'''
-        <div style="text-align:center;margin:0 3px;">
-            <div style="background:#17a2b8;height:{alto}px;width:24px;border-radius:4px;margin:0 auto;"></div>
-            <small>{hora}h</small>
-        </div>'''
-
-    # === TOP VENDEDORES ===
-    vendedores = {}
-    for v in ventas_hoy:
-        vend = v["vendedor"]
-        vendedores[vend] = vendedores.get(vend, 0) + v["total"]
-    top_vendedores = sorted(vendedores.items(), key=lambda x: x[1], reverse=True)[:5]
-    max_vend = max(vendedores.values()) if vendedores else 1
-    grafico_vendedores = ""
-    for vend, total in top_vendedores:
-        ancho = int((total / max_vend) * 260) if max_vend > 0 else 0
-        grafico_vendedores += f'''
-        <div style="margin:6px 0;">
-            <div style="display:flex;align-items:center;font-size:14px;">
-                <span style="width:100px;font-weight:bold;">{vend}</span>
-                <div style="flex:1;background:#eee;height:28px;border-radius:6px;">
-                    <div style="background:#28a745;width:{ancho}px;height:100%;border-radius:6px;"></div>
-                </div>
-                <span style="margin-left:8px;font-weight:bold;">€{total:.2f}</span>
-            </div>
-        </div>'''
-
-    # === TOP PRODUCTOS (JUEGOS) ===
-    juegos = {}
-    for v in ventas_hoy:
-        for p in v["productos"]:
-            juego = p["producto"]
-            cant = p["cantidad"]
-            juegos[juego] = juegos.get(juego, 0) + cant
-    top_juegos = sorted(juegos.items(), key=lambda x: x[1], reverse=True)[:10]
-    max_juego = max(juegos.values()) if juegos else 1
-    grafico_juegos = ""
-    for juego, cant in top_juegos:
-        ancho = int((cant / max_juego) * 260) if max_juego > 0 else 0
-        grafico_juegos += f'''
-        <div style="margin:6px 0;">
-            <div style="display:flex;align-items:center;font-size:14px;">
-                <span style="width:160px;">{juego}</span>
-                <div style="flex:1;background:#eee;height:28px;border-radius:6px;">
-                    <div style="background:#ff6b6b;width:{ancho}px;height:100%;border-radius:6px;"></div>
-                </div>
-                <span style="margin-left:8px;font-weight:bold;">{cant} uds</span>
-            </div>
-        </div>'''
-
-    # === ÚLTIMOS RETIROS ===
-    retiros_html = ""
-    # Asume que los movimientos se cargan desde control_caja.json, el cual también debe ser persistente.
-    for m in movimientos[-5:]:
-        if m.get("tipo") == "Retiro de dueño":
-            retiros_html += f"<tr><td>{m['fecha']}</td><td style='color:red;font-weight:bold;'>-€{abs(m['importe']):.2f}</td></tr>"
-
-    html = f'''
-    <html><head><title>Dashboard Arte Cañete</title>
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <style>
-    body{{font-family:'Segoe UI',Arial;background:#f8f9fa;margin:0;padding:15px;}}
-    .container{{max-width:1000px;margin:auto;}}
-    .card{{background:white;padding:20px;margin:15px 0;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.1);}}
-    h1{{text-align:center;color:#007bff;margin:0 0 20px;font-size:28px;}}
-    h2{{color:#343a40;margin:0 0 15px;font-size:18px;font-weight:600;}}
-    .flex{{display:flex;flex-wrap:wrap;justify-content:space-between;}}
-    table{{width:100%;border-collapse:collapse;margin-top:10px;}} th,td{{border:1px solid #ddd;padding:8px;text-align:left;}}
-    th{{background:#f0f0f0;font-weight:600;}}
-    .btn{{padding:10px 16px;background:#dc3545;color:white;border:none;border-radius:6px;text-decoration:none;font-weight:bold;display:inline-block;margin-top:20px;}}
-    </style>
-    </head><body>
-    <div class="container">
-    <h1>🛒 Dashboard Arte Cañete</h1>
-    
-    <div class="card">
-        <h2>💰 Caja Actual</h2>
-        <p style="font-size:32px;color:#28a745;font-weight:bold;margin:10px 0;">€{caja_actual:.2f}</p>
-        <p style="color:#666;font-size:14px;">{ultimo_retiro_texto}</p>
-        <p>Ventas hoy: <strong>{len(ventas_hoy)}</strong> | Total: <strong>€{total_hoy:.2f}</strong></p>
-    </div>
-
-    <div class="card">
-        <h2>📅 Ventas por Día (Últimos 7 días)</h2>
-        <div class="flex">{grafico_dias}</div>
-    </div>
-
-    <div class="flex">
-        <div style="flex:1;min-width:300px;">
-            <div class="card">
-                <h2>🏆 Top Vendedores (Hoy)</h2>
-                {grafico_vendedores or "<p style='color:#666;'>No hay ventas hoy</p>"}
-            </div>
-        </div>
-        <div style="flex:1;min-width:300px;">
-            <div class="card">
-                <h2>🎮 Top Juegos (Hoy)</h2>
-                {grafico_juegos or "<p style='color:#666;'>No hay ventas hoy</p>"}
-            </div>
-        </div>
-    </div>
-
-    <div class="card">
-        <h2>📊 Ventas por Hora (Hoy)</h2>
-        <div style="display:flex;justify-content:center;align-items:flex-end;height:150px;overflow-x:auto;padding-bottom:10px;border-bottom:1px solid #ddd;">{grafico_horas}</div>
-        <div style="display:flex;justify-content:center;margin-top:5px;"><small style="width:24px;text-align:center;">Hora</small></div>
-    </div>
-
-    <div class="card">
-        <h2>🔄 Últimos Retiros</h2>
-        <table><tr><th>Fecha</th><th>Importe</th></tr>
-        {retiros_html or "<tr><td colspan='2' style='text-align:center;color:#666;'>No hay retiros</td></tr>"}</table>
-    </div>
-
-    <a href="/logout" class="btn">Cerrar Sesión</a>
-    </div>
-    </body></html>'''
-    return html
+    # 6. Guardar el estado consolidado de vuelta a Firebase
+    if DB.set_data(data):
+        return {"status": "success", "message": "Sincronización completa con Firebase."}, 200
+    else:
+        return {"status": "error", "message": "Error al guardar en Firebase."}, 500
 
 if __name__ == '__main__':
-    # Esta configuración es correcta para Render
-    app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
+    # La inicialización de Firebase ocurre en firebase_config.py
+    print("Dashboard iniciado.")
+    # NOTA: En Render, el servidor usará Gunicorn o similar. 
+    # Este 'run' es solo para pruebas locales.
+    app.run(debug=True)
